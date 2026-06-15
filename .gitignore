@@ -1,0 +1,22 @@
+# 采集生成的日志和录屏文件
+captures/
+
+# 打包分发文件
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
