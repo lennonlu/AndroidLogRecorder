@@ -17,6 +17,7 @@ import threading
 import time
 import os
 import sys
+import signal
 import re
 import shutil
 from datetime import datetime
@@ -477,6 +478,9 @@ class AndroidLogger:
         """停止所有采集"""
         self._stop_event.set()
 
+        # 最先恢复触摸显示（此时 ADB 连接最稳定，避免后续断连导致恢复失败）
+        self._restore_show_touches()
+
         # 停止 logcat
         if self._logcat_proc:
             try:
@@ -517,9 +521,6 @@ class AndroidLogger:
         if self._record_thread and self._record_thread.is_alive():
             print("   ⏳ 等待最后一段录屏拉取完成...")
             self._record_thread.join(timeout=120)
-
-        # 恢复触摸显示设置
-        self._restore_show_touches()
 
         # flush + 关闭文件
         if self.log_file:
@@ -605,23 +606,33 @@ class AndroidLogger:
 
         print("\n🟢 采集中... 按 Ctrl+C 停止\n")
 
-        # 5. 主循环：正计时 + 每 5 秒检查设备连接
+        # 注册信号处理：Ctrl+C 直接设置 stop_event，确保一次按键即响应
+        def _on_sigint(signum, frame):
+            self._stop_event.set()
+        original_handler = signal.signal(signal.SIGINT, _on_sigint)
+
+        # 5. 主循环：正计时 + 每 0.5 秒检查停止信号和设备连接
         start_time = time.time()
-        try:
-            while not self._stop_event.is_set():
-                for _ in range(10):  # 每 0.5 秒更新一次计时，共 5 秒
-                    if self._stop_event.is_set():
-                        break
-                    elapsed = int(time.time() - start_time)
-                    h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
-                    print(f"\r⏱  已采集 {h:02d}:{m:02d}:{s:02d}   ", end="", flush=True)
-                    time.sleep(0.5)
+        last_conn_check = start_time
+        while not self._stop_event.is_set():
+            # 更新计时
+            elapsed = int(time.time() - start_time)
+            h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
+            print(f"\r⏱  已采集 {h:02d}:{m:02d}:{s:02d}   ", end="", flush=True)
+            # 等待 0.5 秒，Ctrl+C 会通过信号处理器立即设置 stop_event
+            self._stop_event.wait(0.5)
+            # 每 5 秒检查一次设备连接
+            if time.time() - last_conn_check > 5:
                 if not self.is_device_connected():
                     print(f"\n\n📴 设备已断开，自动停止采集...")
                     break
-        except KeyboardInterrupt:
-            print("\n")
-            print("⚠️  正在停止采集，请勿关闭窗口...")
+                last_conn_check = time.time()
+
+        # 恢复原始信号处理器
+        signal.signal(signal.SIGINT, original_handler)
+
+        if self._stop_event.is_set():
+            print("\n⚠️  正在停止采集，请勿关闭窗口...")
             print("   （正在等待最后一段录屏保存并拉取到本地）")
 
         # 6. 清理 & 摘要
