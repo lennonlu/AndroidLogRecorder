@@ -17,7 +17,6 @@ import threading
 import time
 import os
 import sys
-import signal
 import re
 import shutil
 from datetime import datetime
@@ -35,7 +34,8 @@ ADB_PATH = (
     else (shutil.which("adb") or r"D:\Android_tools\platform-tools\adb.exe")
 )
 RECORD_SEGMENT_SEC = 170          # 每段录屏秒数（adb 上限 180s，留 10s 余量）
-RECORD_SIZE = "1280x720"          # 录屏分辨率（横屏格式，降低以减小文件体积）
+RECORD_SIZE_LANDSCAPE = "1280x720" # 横屏分辨率（宽 x 高，大数在前）
+RECORD_SIZE_PORTRAIT = "720x1280"  # 竖屏分辨率（宽 x 高，小数在前）
 RECORD_BITRATE = "4M"             # 录屏码率（默认 20Mbps，降到 4Mbps）
 DEVICE_POLL_INTERVAL = 3          # 设备检测间隔（秒）
 
@@ -69,14 +69,15 @@ CRASH_RULES_QUIET = [
 class AndroidLogger:
     """主控类：管理 logcat 采集、录屏、崩溃检测"""
 
+    CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
     def __init__(self, output_dir: str = None, enable_record: bool = True):
         self.enable_record = enable_record
+        self.record_size = RECORD_SIZE_LANDSCAPE  # 默认横屏，运行时可选
         self.serial = None
         self.device_model = ""
         self.android_ver = ""
         self._original_show_touches = None  # 录屏前保存原始触摸显示状态
-        self._original_auto_rotate = None   # 录屏前保存自动旋转状态
-        self._original_user_rotation = None # 录屏前保存屏幕方向
 
         # 输出目录：延迟到设备连接后再创建（需要型号信息）
         self._output_base = Path(output_dir) if output_dir else Path(_script_dir) / "captures"
@@ -92,6 +93,7 @@ class AndroidLogger:
         self._crash_count = 0
         self._crash_quiet_count = 0
         self._record_files = []
+        self._current_segment = 0
 
     # ---------- 设备检测 ----------
     def _get_connected_devices(self) -> list:
@@ -100,7 +102,7 @@ class AndroidLogger:
             result = subprocess.run(
                 [ADB_PATH, "devices"],
                 capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                creationflags=self.CREATE_NO_WINDOW,
             )
             devices = []
             for line in result.stdout.strip().split("\n")[1:]:
@@ -117,7 +119,7 @@ class AndroidLogger:
             r = subprocess.run(
                 [ADB_PATH, "-s", serial, "shell", "getprop", key],
                 capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                creationflags=self.CREATE_NO_WINDOW,
             )
             return r.stdout.strip()
         except Exception:
@@ -206,7 +208,7 @@ class AndroidLogger:
         try:
             r = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                creationflags=self.CREATE_NO_WINDOW,
             )
             return r.stdout.strip()
         except Exception:
@@ -224,31 +226,13 @@ class AndroidLogger:
             self._adb_setting("put", "show_touches", self._original_show_touches)
             self._original_show_touches = None
 
-    # ---------- 屏幕方向控制 ----------
-    def _force_landscape(self):
-        """录屏前强制横屏：关闭自动旋转 + 设置为横屏"""
-        self._original_auto_rotate = self._adb_setting("get", "accelerometer_rotation")
-        self._original_user_rotation = self._adb_setting("get", "user_rotation")
-        self._adb_setting("put", "accelerometer_rotation", "0")  # 关闭自动旋转
-        self._adb_setting("put", "user_rotation", "1")           # 1=横屏(90°)
-        print("🔄 已强制横屏（录屏结束后恢复）")
-
-    def _restore_rotation(self):
-        """停止录屏后恢复屏幕方向"""
-        if self._original_auto_rotate is not None:
-            self._adb_setting("put", "accelerometer_rotation", self._original_auto_rotate)
-            self._original_auto_rotate = None
-        if self._original_user_rotation is not None:
-            self._adb_setting("put", "user_rotation", self._original_user_rotation)
-            self._original_user_rotation = None
-
     def is_device_connected(self) -> bool:
         """检查设备是否仍连接"""
         try:
             r = subprocess.run(
                 [ADB_PATH, "-s", self.serial, "get-state"],
                 capture_output=True, text=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+                creationflags=self.CREATE_NO_WINDOW,
             )
             return "device" in r.stdout
         except Exception:
@@ -287,10 +271,9 @@ class AndroidLogger:
     def _start_logcat(self):
         """后台线程：持续采集 logcat 输出"""
         cmd = [ADB_PATH, "-s", self.serial, "logcat", "-v", "threadtime"]
-        CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
         self._logcat_proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NO_WINDOW,
+            creationflags=self.CREATE_NO_WINDOW,
         )
         t = threading.Thread(target=self._read_logcat, daemon=True)
         t.start()
@@ -302,11 +285,19 @@ class AndroidLogger:
             today_prefix = datetime.now().strftime("%m-%d")  # 如 "06-15"
             context_remaining = {}  # {rule_label: 剩余需要采集的上下文行数}
             prev_kept = True        # 上一行是否被保留（用于处理续行）
+            lines_since_flush = 0   # 批量 flush 计数器
+            last_date_check = time.time()  # 上次检查日期的时间
 
             for raw_line in iter(self._logcat_proc.stdout.readline, b""):
                 if self._stop_event.is_set():
                     break
                 line = raw_line.decode("utf-8", errors="replace")
+
+                # 每 60 秒更新一次 today_prefix（处理跨午夜场景）
+                now = time.time()
+                if now - last_date_check > 60:
+                    today_prefix = datetime.now().strftime("%m-%d")
+                    last_date_check = now
 
                 # 只保留今天的日志（logcat 格式: "MM-DD HH:MM:SS.mmm ..."）
                 is_date_line = len(line) >= 5 and line[:2].isdigit() and line[2] == '-' and line[3:5].isdigit()
@@ -317,7 +308,10 @@ class AndroidLogger:
                     continue
 
                 self.log_file.write(line)
-                self.log_file.flush()
+                lines_since_flush += 1
+                if lines_since_flush >= 100:
+                    self.log_file.flush()
+                    lines_since_flush = 0
 
                 # --- 高优先级规则：写入 crashes.log（不打印，避免干扰） ---
                 matched_alert = False
@@ -355,8 +349,9 @@ class AndroidLogger:
                         self.crash_file.flush()
                         break
 
-        except Exception:
-            pass
+        except Exception as e:
+            if not self._stop_event.is_set():
+                print(f"\n⚠️ Logcat 采集异常: {e}")
 
     # ---------- 录屏 ----------
     def _start_recording_loop(self):
@@ -367,9 +362,27 @@ class AndroidLogger:
         self._record_thread.start()
         print("🎥 屏幕录制已启动（每段 170s 自动续录）")
 
+    def _check_device_storage(self):
+        """检查设备存储空间，低于 500MB 时清理已拉取的录屏并警告"""
+        try:
+            r = subprocess.run(
+                [ADB_PATH, "-s", self.serial, "shell", "df", "/sdcard"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=self.CREATE_NO_WINDOW,
+            )
+            for line in r.stdout.strip().split("\n")[1:]:
+                parts = line.split()
+                if len(parts) >= 4 and parts[0].startswith("/"):
+                    avail_kb = int(parts[3])
+                    avail_mb = avail_kb / 1024
+                    if avail_mb < 500:
+                        print(f"\n⚠️ 设备存储不足: 剩余 {avail_mb:.0f} MB，建议及时清理")
+                        return
+        except Exception:
+            pass
+
     def _pull_record_file(self, remote_path: str, local_path: Path, filename: str) -> bool:
         """从设备拉取录屏文件到本地，返回是否成功"""
-        CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
         try:
             # 等待文件在设备上落盘（screenrecord 结束后可能需要一点时间）
             time.sleep(1)
@@ -378,7 +391,7 @@ class AndroidLogger:
             check = subprocess.run(
                 [ADB_PATH, "-s", self.serial, "shell", "ls", "-la", remote_path],
                 capture_output=True, text=True, timeout=10,
-                creationflags=CREATE_NO_WINDOW,
+                creationflags=self.CREATE_NO_WINDOW,
             )
             if "No such file" in check.stderr or check.returncode != 0:
                 print(f"   ⚠️ {filename} 在设备上不存在，跳过")
@@ -388,7 +401,7 @@ class AndroidLogger:
             result = subprocess.run(
                 [ADB_PATH, "-s", self.serial, "pull", remote_path, str(local_path)],
                 capture_output=True, text=True, timeout=120,
-                creationflags=CREATE_NO_WINDOW,
+                creationflags=self.CREATE_NO_WINDOW,
             )
 
             if result.returncode != 0:
@@ -416,21 +429,25 @@ class AndroidLogger:
     def _recording_loop(self):
         """录屏主循环：录完一段自动开始下一段"""
         segment = 0
-        CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
         while True:
             segment += 1
+            self._current_segment = segment
             ts = datetime.now().strftime("%H%M%S")
             filename = f"screen_{segment:03d}_{ts}.mp4"
             remote_path = f"/sdcard/screen_{segment:03d}.mp4"
             local_path = self.session_dir / filename
+
+            # 检查设备存储空间（低于 500MB 时清理之前的录屏并警告）
+            if segment > 1:
+                self._check_device_storage()
 
             # 在手机上录屏（--bugreport 在画面左上角叠加时间戳）
             cmd = [
                 ADB_PATH, "-s", self.serial, "shell",
                 "screenrecord",
                 "--bugreport",
-                "--size", RECORD_SIZE,
+                "--size", self.record_size,
                 "--bit-rate", RECORD_BITRATE,
                 "--time-limit", str(RECORD_SEGMENT_SEC),
                 remote_path,
@@ -438,7 +455,7 @@ class AndroidLogger:
             try:
                 self._record_proc = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    creationflags=CREATE_NO_WINDOW,
+                    creationflags=self.CREATE_NO_WINDOW,
                 )
                 self._record_proc.wait()
             except Exception as e:
@@ -459,7 +476,6 @@ class AndroidLogger:
     def _stop_all(self):
         """停止所有采集"""
         self._stop_event.set()
-        CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
         # 停止 logcat
         if self._logcat_proc:
@@ -475,11 +491,13 @@ class AndroidLogger:
         # 停止录屏（向手机发停止信号，让 screenrecord 优雅结束并保存文件）
         if self._record_proc and self._record_proc.poll() is None:
             try:
+                # 用当前录屏文件路径精确匹配，避免误杀其他 screenrecord 进程
+                current_file = f"/sdcard/screen_{self._current_segment:03d}.mp4"
                 subprocess.run(
                     [ADB_PATH, "-s", self.serial, "shell",
-                     "pkill", "-INT", "screenrecord"],
+                     "pkill", "-INT", "-f", current_file],
                     capture_output=True, timeout=10,
-                    creationflags=CREATE_NO_WINDOW,
+                    creationflags=self.CREATE_NO_WINDOW,
                 )
                 # 等待录屏进程结束（给时间保存文件）
                 self._record_proc.wait(timeout=15)
@@ -503,10 +521,12 @@ class AndroidLogger:
         # 恢复触摸显示设置
         self._restore_show_touches()
 
-        # 关闭文件
+        # flush + 关闭文件
         if self.log_file:
+            self.log_file.flush()
             self.log_file.close()
         if self.crash_file:
+            self.crash_file.flush()
             self.crash_file.close()
 
     def _print_summary(self):
@@ -557,13 +577,29 @@ class AndroidLogger:
             print("❌ 未检测到设备，退出")
             return
 
-        # 2. 初始化
+        # 2. 选择录屏方向
+        if self.enable_record:
+            print("\n录屏方向：")
+            print("  [1] 横屏 1280x720（默认）")
+            print("  [2] 竖屏 720x1280")
+            try:
+                orient = input("请选择 (1/2，直接回车默认横屏): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                orient = ""
+            if orient == "2":
+                self.record_size = RECORD_SIZE_PORTRAIT
+                print("✅ 竖屏模式 720x1280")
+            else:
+                self.record_size = RECORD_SIZE_LANDSCAPE
+                print("✅ 横屏模式 1280x720")
+
+        # 3. 初始化
         self._init_session()
 
-        # 3. 启动 logcat
+        # 4. 启动 logcat
         self._start_logcat()
 
-        # 4. 启动录屏（如果启用）
+        # 5. 启动录屏（如果启用）
         if self.enable_record:
             self._start_recording_loop()
 
@@ -591,6 +627,12 @@ class AndroidLogger:
         # 6. 清理 & 摘要
         self._stop_all()
         self._print_summary()
+
+        # 等待用户确认，防止窗口直接关闭
+        try:
+            input("按回车键退出...")
+        except (EOFError, KeyboardInterrupt):
+            pass
 
 
 def main():

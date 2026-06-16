@@ -3,6 +3,7 @@ captures/
 
 # 打包分发文件
 *.zip
+dist/
 
 # Python
 __pycache__/
