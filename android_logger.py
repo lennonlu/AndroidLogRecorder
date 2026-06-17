@@ -76,6 +76,7 @@ class AndroidLogger:
         self.enable_record = enable_record
         self.record_size = RECORD_SIZE_LANDSCAPE  # 默认横屏，运行时可选
         self.serial = None
+        self.device_brand = ""
         self.device_model = ""
         self.android_ver = ""
         self._original_show_touches = None  # 录屏前保存原始触摸显示状态
@@ -130,12 +131,13 @@ class AndroidLogger:
         """多设备时让用户选择，返回选中的序列号"""
         print(f"\n📱 检测到 {len(devices)} 台设备，请选择：\n")
 
-        # 先批量查询型号信息
+        # 先批量查询品牌+型号信息
         device_info = []
         for i, serial in enumerate(devices, 1):
+            brand = self._get_device_prop(serial, "ro.product.brand")
             model = self._get_device_prop(serial, "ro.product.model")
             android_ver = self._get_device_prop(serial, "ro.build.version.release")
-            label = f"{model} (Android {android_ver})" if model else serial
+            label = f"{brand} {model} (Android {android_ver})".strip() if model else serial
             device_info.append((serial, label))
             print(f"  [{i}] {serial}  —  {label}")
 
@@ -166,7 +168,7 @@ class AndroidLogger:
                 self._query_device_info()
                 print(f"✅ 设备就绪: {self.serial}")
                 if self.device_model:
-                    print(f"   型号: {self.device_model}  |  Android {self.android_ver}")
+                    print(f"   型号: {self.device_brand} {self.device_model}  |  Android {self.android_ver}")
                 return True
             else:
                 print(f"⚠️ 未找到设备 {self.serial}，进入等待模式...")
@@ -189,14 +191,15 @@ class AndroidLogger:
                 if len(devices) == 1:
                     print(f"✅ 检测到设备: {self.serial}")
                     if self.device_model:
-                        print(f"   型号: {self.device_model}  |  Android {self.android_ver}")
+                        print(f"   型号: {self.device_brand} {self.device_model}  |  Android {self.android_ver}")
                 return True
 
             self._stop_event.wait(DEVICE_POLL_INTERVAL)
         return False
 
     def _query_device_info(self):
-        """获取当前设备型号和 Android 版本"""
+        """获取当前设备品牌、型号和 Android 版本"""
+        self.device_brand = self._get_device_prop(self.serial, "ro.product.brand")
         self.device_model = self._get_device_prop(self.serial, "ro.product.model")
         self.android_ver = self._get_device_prop(self.serial, "ro.build.version.release")
 
@@ -628,16 +631,16 @@ class AndroidLogger:
                     break
                 last_conn_check = time.time()
 
-        # 恢复原始信号处理器
-        signal.signal(signal.SIGINT, original_handler)
-
         if self._stop_event.is_set():
             print("\n⚠️  正在停止采集，请勿关闭窗口...")
             print("   （正在等待最后一段录屏保存并拉取到本地）")
 
-        # 6. 清理 & 摘要
+        # 6. 清理 & 摘要（保持信号处理器活跃，避免清理期间 Ctrl+C 导致崩溃）
         self._stop_all()
         self._print_summary()
+
+        # 清理完成后再恢复原始信号处理器
+        signal.signal(signal.SIGINT, original_handler)
 
         # 等待用户确认，防止窗口直接关闭
         try:
