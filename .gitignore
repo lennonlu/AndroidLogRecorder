@@ -4,6 +4,7 @@ captures/
 # 打包分发文件
 *.zip
 dist/
+build/
 
 # Python
 __pycache__/

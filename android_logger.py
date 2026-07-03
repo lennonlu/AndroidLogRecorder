@@ -5,7 +5,7 @@ Android 自动日志采集 & 录屏工具
 ===============================
 插上安卓手机（USB调试已开启）后运行本脚本，自动完成：
   1. 实时 logcat 日志采集（全程保存为 .log 文件）
-  2. 屏幕录制（每段最长 170s，自动循环续录，无缝拼接）
+  2. 屏幕录制（每段最长 60s，自动循环续录，无缝拼接）
   3. 崩溃 / ANR 自动检测（发现即高亮提示并单独归档）
   4. Ctrl+C 优雅停止，输出本次采集摘要
 
@@ -34,10 +34,10 @@ ADB_PATH = (
     os.path.join(_script_dir, "adb.exe") if os.path.isfile(os.path.join(_script_dir, "adb.exe"))
     else (shutil.which("adb") or r"D:\Android_tools\platform-tools\adb.exe")
 )
-RECORD_SEGMENT_SEC = 170          # 每段录屏秒数（adb 上限 180s，留 10s 余量）
-RECORD_SIZE_LANDSCAPE = "1280x720" # 横屏分辨率（宽 x 高，大数在前）
-RECORD_SIZE_PORTRAIT = "720x1280"  # 竖屏分辨率（宽 x 高，小数在前）
-RECORD_BITRATE = "4M"             # 录屏码率（默认 20Mbps，降到 4Mbps）
+RECORD_SEGMENT_SEC = 60           # 每段录屏秒数
+RECORD_SIZE_LANDSCAPE = "1280x720" # 横屏分辨率
+RECORD_SIZE_PORTRAIT = "720x1280"  # 竖屏分辨率
+RECORD_BITRATE = "4M"             # 录屏码率
 DEVICE_POLL_INTERVAL = 3          # 设备检测间隔（秒）
 
 # ---------- 崩溃检测规则 ----------
@@ -79,6 +79,7 @@ class AndroidLogger:
         self.device_brand = ""
         self.device_model = ""
         self.android_ver = ""
+        self.is_emulator = False  # 是否为模拟器（拉取后自动清理远程文件）
         self._original_show_touches = None  # 录屏前保存原始触摸显示状态
 
         # 输出目录：延迟到设备连接后再创建（需要型号信息）
@@ -202,6 +203,25 @@ class AndroidLogger:
         self.device_brand = self._get_device_prop(self.serial, "ro.product.brand")
         self.device_model = self._get_device_prop(self.serial, "ro.product.model")
         self.android_ver = self._get_device_prop(self.serial, "ro.build.version.release")
+        self.is_emulator = self._is_emulator()
+
+    def _is_emulator(self) -> bool:
+        """检测当前连接的设备是否为模拟器"""
+        # 1. 序列号特征
+        if self.serial and ("emulator" in self.serial.lower() or self.serial.startswith("127.0.0.1")):
+            return True
+        # 2. QEMU 内核标记
+        if self._get_device_prop(self.serial, "ro.kernel.qemu") == "1":
+            return True
+        # 3. 硬件类型（goldfish/ranchu 是 Android Emulator；vbox 是 VirtualBox/逍遥等）
+        hw = self._get_device_prop(self.serial, "ro.hardware").lower()
+        if hw in ("goldfish", "ranchu", "vbox86", "vbox86p") or "vbox" in hw:
+            return True
+        # 4. 主板型号
+        board = self._get_device_prop(self.serial, "ro.product.board").lower()
+        if board in ("goldfish", "ranchu") or "vbox" in board:
+            return True
+        return False
 
     # ---------- 触摸显示控制 ----------
     def _adb_setting(self, action: str, key: str, value: str = None) -> str:
@@ -359,12 +379,12 @@ class AndroidLogger:
 
     # ---------- 录屏 ----------
     def _start_recording_loop(self):
-        """后台线程：循环录屏，每段 170s 自动续录"""
+        """后台线程：循环录屏，每段 60s 自动续录"""
         # 开启触摸显示
         self._enable_show_touches()
         self._record_thread = threading.Thread(target=self._recording_loop, daemon=True)
         self._record_thread.start()
-        print("🎥 屏幕录制已启动（每段 170s 自动续录）")
+        print("🎥 屏幕录制已启动（每段 60s 自动续录）")
 
     def _check_device_storage(self):
         """检查设备存储空间，低于 500MB 时清理已拉取的录屏并警告"""
@@ -420,7 +440,16 @@ class AndroidLogger:
                 print(f"   ⚠️ {filename} 拉取后本地文件为空或不存在")
                 return False
 
-            # 设备上保留一份，不删除
+            # 模拟器：拉取后删除远程临时文件，防止虚拟磁盘膨胀
+            if self.is_emulator:
+                try:
+                    subprocess.run(
+                        [ADB_PATH, "-s", self.serial, "shell", "rm", "-f", remote_path],
+                        capture_output=True, timeout=10,
+                        creationflags=self.CREATE_NO_WINDOW,
+                    )
+                except Exception:
+                    pass  # 删除失败静默处理，不影响主流程
             return True
 
         except subprocess.TimeoutExpired:
@@ -437,8 +466,7 @@ class AndroidLogger:
         while True:
             segment += 1
             self._current_segment = segment
-            ts = datetime.now().strftime("%H%M%S")
-            filename = f"screen_{segment:03d}_{ts}.mp4"
+            filename = f"screen_{datetime.now().strftime('%Y%m%d%H%M%S')}.mp4"
             remote_path = f"/sdcard/screen_{segment:03d}.mp4"
             local_path = self.session_dir / filename
 
