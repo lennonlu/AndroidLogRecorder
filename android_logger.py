@@ -20,6 +20,8 @@ import sys
 import signal
 import re
 import shutil
+import socket
+import csv
 from datetime import datetime
 from pathlib import Path
 
@@ -34,11 +36,22 @@ ADB_PATH = (
     os.path.join(_script_dir, "adb.exe") if os.path.isfile(os.path.join(_script_dir, "adb.exe"))
     else (shutil.which("adb") or r"D:\Android_tools\platform-tools\adb.exe")
 )
+SCRCPY_DIR = os.path.join(_script_dir, "scrcpy-win64-v4.1")
+SCRCPY_PATH = os.path.join(SCRCPY_DIR, "scrcpy.exe")
+FFMPEG_PATH = os.path.join(SCRCPY_DIR, "ffmpeg.exe")
 RECORD_SEGMENT_SEC = 60           # 每段录屏秒数
-RECORD_SIZE_LANDSCAPE = "1280x720" # 横屏分辨率
-RECORD_SIZE_PORTRAIT = "720x1280"  # 竖屏分辨率
+RECORD_MAX_SHORT_SIDE = 720       # 普通设备录屏短边上限
 RECORD_BITRATE = "4M"             # 录屏码率
 DEVICE_POLL_INTERVAL = 3          # 设备检测间隔（秒）
+
+# 常见安卓模拟器的本机 ADB 端口
+EMULATOR_CONNECTIONS = [
+    ("雷电模拟器", "127.0.0.1:5555", "emulator-5554"),
+    ("夜神模拟器", "127.0.0.1:62001", None),
+    ("逍遥模拟器", "127.0.0.1:21503", None),
+    ("MuMu模拟器", "127.0.0.1:7555", None),
+    ("BlueStacks", "127.0.0.1:5555", None),
+]
 
 # ---------- 崩溃检测规则 ----------
 # 采用精确匹配，减少误报。每条规则格式：(pattern, label, context_lines)
@@ -71,15 +84,17 @@ class AndroidLogger:
     """主控类：管理 logcat 采集、录屏、崩溃检测"""
 
     CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+    CREATE_NEW_PROCESS_GROUP = 0x00000200 if sys.platform == "win32" else 0
 
     def __init__(self, output_dir: str = None, enable_record: bool = True):
         self.enable_record = enable_record
-        self.record_size = RECORD_SIZE_LANDSCAPE  # 默认横屏，运行时可选
+        self.record_size = None  # 普通设备连接后按实际屏幕比例自动计算
         self.serial = None
         self.device_brand = ""
         self.device_model = ""
         self.android_ver = ""
         self.is_emulator = False  # 是否为模拟器（拉取后自动清理远程文件）
+        self.is_memu = False      # 逍遥模拟器使用 scrcpy 连续录屏
         self._original_show_touches = None  # 录屏前保存原始触摸显示状态
 
         # 输出目录：延迟到设备连接后再创建（需要型号信息）
@@ -97,8 +112,130 @@ class AndroidLogger:
         self._crash_quiet_count = 0
         self._record_files = []
         self._current_segment = 0
+        self._scrcpy_raw_path = None
+        self._scrcpy_started_at = None
+        self._scrcpy_log_handle = None
 
     # ---------- 设备检测 ----------
+    def _is_device_online(self, serial: str) -> bool:
+        """检查指定序列号是否处于可用的 device 状态。"""
+        try:
+            result = subprocess.run(
+                [ADB_PATH, "-s", serial, "get-state"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=self.CREATE_NO_WINDOW,
+            )
+            return result.returncode == 0 and result.stdout.strip() == "device"
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_tcp_port_open(address: str) -> bool:
+        """快速检测模拟器 ADB 端口，避免 adb connect 长时间等待。"""
+        try:
+            host, port = address.rsplit(":", 1)
+            with socket.create_connection((host, int(port)), timeout=1):
+                return True
+        except (OSError, ValueError):
+            return False
+
+    def _disconnect_address(self, address: str):
+        """清理指定 TCP 地址在 ADB 中的离线记录。"""
+        try:
+            subprocess.run(
+                [ADB_PATH, "disconnect", address],
+                capture_output=True, text=True, timeout=5,
+                creationflags=self.CREATE_NO_WINDOW,
+            )
+        except Exception:
+            pass
+
+    def _wait_for_address(self, address: str, retries: int = 8) -> bool:
+        """短暂等待刚连接的 TCP 设备进入 device 状态。"""
+        for _ in range(retries):
+            if self._is_device_online(address):
+                return True
+            if self._stop_event.wait(1):
+                break
+        return False
+
+    def _connect_address(self, address: str, wait_ready: bool = True) -> bool:
+        """连接一个模拟器 ADB 地址，返回是否已发起或已在线。"""
+        if self._is_device_online(address):
+            print(f"✅ {address} 已在线")
+            return True
+
+        if not self._is_tcp_port_open(address):
+            self._disconnect_address(address)
+            print(f"⏭️  {address} 端口未开放，已跳过")
+            return False
+
+        self._disconnect_address(address)
+        try:
+            result = subprocess.run(
+                [ADB_PATH, "connect", address],
+                capture_output=True, text=True, timeout=8,
+                creationflags=self.CREATE_NO_WINDOW,
+            )
+            message = (result.stdout or result.stderr).strip()
+            if message:
+                print(f"   {message}")
+            if result.returncode != 0:
+                return False
+        except Exception as exc:
+            print(f"⚠️ 连接 {address} 失败: {exc}")
+            return False
+
+        if not wait_ready or self._wait_for_address(address):
+            return True
+        print(f"⚠️ {address} 尚未就绪，将继续扫描当前在线设备")
+        return False
+
+    def _connect_emulator(self, name: str, address: str,
+                          alternate_serial: str = None) -> bool:
+        """连接一类模拟器；雷电优先识别其 emulator-* 本地序列号。"""
+        print(f"\n🔌 正在连接{name}...")
+        if alternate_serial and self._is_device_online(alternate_serial):
+            if not self._is_device_online(address):
+                self._disconnect_address(address)
+            print(f"✅ 已连接{name}: {alternate_serial}")
+            return True
+        return self._connect_address(address)
+
+    def prompt_emulator_connection(self):
+        """显示常见模拟器快速连接菜单并执行用户选择。"""
+        print("\n快速连接模拟器：")
+        for index, (name, address, _) in enumerate(EMULATOR_CONNECTIONS, 1):
+            suffix = " / emulator-5554" if name == "雷电模拟器" else ""
+            print(f"  [{index}] {name} ({address}{suffix})")
+        print("  [6] 全部尝试")
+        print("  [7] 跳过，直接扫描设备（默认）")
+
+        while True:
+            try:
+                choice = input("请选择 (1-7，直接回车跳过): ").strip() or "7"
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+
+            if choice in {str(i) for i in range(1, 6)}:
+                self._connect_emulator(*EMULATOR_CONNECTIONS[int(choice) - 1])
+                return
+            if choice == "6":
+                print("\n🔌 正在尝试连接所有模拟器...")
+                seen_addresses = set()
+                for _, address, alternate_serial in EMULATOR_CONNECTIONS:
+                    if alternate_serial and self._is_device_online(alternate_serial):
+                        print(f"✅ {alternate_serial} 已在线")
+                    if address not in seen_addresses:
+                        self._connect_address(address, wait_ready=False)
+                        seen_addresses.add(address)
+                self._stop_event.wait(1)
+                return
+            if choice == "7":
+                return
+            print("⚠️ 请输入 1 到 7 之间的数字")
+
     def _get_connected_devices(self) -> list:
         """获取所有已连接设备的序列号列表"""
         try:
@@ -204,6 +341,82 @@ class AndroidLogger:
         self.device_model = self._get_device_prop(self.serial, "ro.product.model")
         self.android_ver = self._get_device_prop(self.serial, "ro.build.version.release")
         self.is_emulator = self._is_emulator()
+        self.is_memu = self._is_memu()
+
+    def _is_memu(self) -> bool:
+        """通过默认 ADB 端口或系统包识别逍遥模拟器。"""
+        if self.serial == "127.0.0.1:21503":
+            return True
+        try:
+            result = subprocess.run(
+                [ADB_PATH, "-s", self.serial, "shell", "pm", "path",
+                 "com.microvirt.launcher2"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=self.CREATE_NO_WINDOW,
+            )
+            return result.returncode == 0 and "package:" in result.stdout
+        except Exception:
+            return False
+
+    def _get_screen_size(self):
+        """读取设备当前有效屏幕尺寸，存在 Override 时优先使用。"""
+        try:
+            result = subprocess.run(
+                [ADB_PATH, "-s", self.serial, "shell", "wm", "size"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=self.CREATE_NO_WINDOW,
+            )
+            sizes = re.findall(r"(\d+)\s*x\s*(\d+)", result.stdout)
+            if sizes:
+                width, height = map(int, sizes[-1])
+                if width > 0 and height > 0:
+                    return width, height
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _fit_record_size(width: int, height: int, max_short_side: int = 720):
+        """等比限制短边；仅缩小不放大，缩放结果对齐到 8 像素。"""
+        short_side = min(width, height)
+        if short_side <= max_short_side:
+            return width, height
+
+        scale = max_short_side / short_side
+        if width <= height:
+            target_width = max_short_side
+            target_height = max(8, int(height * scale) // 8 * 8)
+        else:
+            target_height = max_short_side
+            target_width = max(8, int(width * scale) // 8 * 8)
+        return target_width, target_height
+
+    def _configure_record_size(self, portrait: bool = False):
+        """按设备实际比例和用户选择设置普通 screenrecord 的分辨率。"""
+        screen_size = self._get_screen_size()
+        if not screen_size:
+            # 极少数裁剪系统没有 wm 命令，仍保证短边不超过 720。
+            self.record_size = "720x1280" if portrait else "1280x720"
+            print(f"⚠️ 未能读取屏幕尺寸，录屏分辨率回退为 {self.record_size}")
+            return
+
+        width, height = screen_size
+        target_width, target_height = self._fit_record_size(
+            width, height, RECORD_MAX_SHORT_SIDE
+        )
+        long_side = max(target_width, target_height)
+        short_side = min(target_width, target_height)
+        if portrait:
+            target_width, target_height = short_side, long_side
+        else:
+            target_width, target_height = long_side, short_side
+        self.record_size = f"{target_width}x{target_height}"
+        orientation = "竖屏" if portrait else "横屏"
+        size_note = "原始短边不超过 720，不放大" if min(width, height) <= RECORD_MAX_SHORT_SIDE else "等比限制短边为 720"
+        print(
+            f"✅ {orientation}录屏: {self.record_size} "
+            f"（设备 {width}x{height}，{size_note}）"
+        )
 
     def _is_emulator(self) -> bool:
         """检测当前连接的设备是否为模拟器"""
@@ -379,12 +592,201 @@ class AndroidLogger:
 
     # ---------- 录屏 ----------
     def _start_recording_loop(self):
-        """后台线程：循环录屏，每段 60s 自动续录"""
+        """启动与设备匹配的后台录屏流程。"""
         # 开启触摸显示
         self._enable_show_touches()
-        self._record_thread = threading.Thread(target=self._recording_loop, daemon=True)
+        target = self._scrcpy_recording_loop if self.is_memu else self._recording_loop
+        self._record_thread = threading.Thread(target=target, daemon=True)
         self._record_thread.start()
-        print("🎥 屏幕录制已启动（每段 60s 自动续录）")
+        if self.is_memu:
+            print("🎥 逍遥兼容录屏已启动（scrcpy 连续录制，停止后无损分段）")
+        else:
+            print("🎥 屏幕录制已启动（每段 60s 自动续录）")
+
+    def _scrcpy_recording_loop(self):
+        """逍遥模拟器：用一个 scrcpy 进程连续录制，避免分段空档。"""
+        if not Path(SCRCPY_PATH).is_file():
+            print(f"   ⚠️ 逍遥录屏组件缺失: {SCRCPY_PATH}")
+            self._stop_event.set()
+            return
+
+        self._scrcpy_started_at = datetime.now()
+        stamp = self._scrcpy_started_at.strftime("%Y%m%d%H%M%S")
+        self._scrcpy_raw_path = (self.session_dir / f"screen_raw_{stamp}.mkv").resolve()
+        scrcpy_log_path = self.session_dir / "scrcpy_record.log"
+        cmd = [
+            SCRCPY_PATH,
+            "-s", self.serial,
+            "--record", str(self._scrcpy_raw_path),
+            "--no-window",
+            "--no-audio",
+            "--max-size", "1280",
+            "--max-fps", "30",
+            "--video-bit-rate", RECORD_BITRATE,
+        ]
+
+        try:
+            self._scrcpy_log_handle = open(
+                scrcpy_log_path, "w", encoding="utf-8", errors="replace"
+            )
+            self._record_proc = subprocess.Popen(
+                cmd,
+                stdout=self._scrcpy_log_handle,
+                stderr=subprocess.STDOUT,
+                cwd=SCRCPY_DIR,
+                # 独立进程组允许 Windows 定向发送 CTRL_BREAK，让 MKV 正常收尾。
+                creationflags=self.CREATE_NEW_PROCESS_GROUP,
+            )
+            if self._stop_event.is_set():
+                self._stop_scrcpy_process()
+            return_code = self._record_proc.wait()
+            expected_stop = self._stop_event.is_set()
+            if not expected_stop:
+                print(f"\n⚠️ scrcpy 录屏意外结束（退出码: {return_code}），停止本次采集")
+                self._stop_event.set()
+        except Exception as exc:
+            print(f"\n⚠️ scrcpy 录屏启动失败: {exc}")
+            self._stop_event.set()
+        finally:
+            if self._scrcpy_log_handle:
+                self._scrcpy_log_handle.flush()
+                self._scrcpy_log_handle.close()
+                self._scrcpy_log_handle = None
+
+        self._split_scrcpy_recording()
+
+    def _split_scrcpy_recording(self) -> bool:
+        """按关键帧将 scrcpy 原片无损切成约 60 秒的 MP4。"""
+        raw_path = self._scrcpy_raw_path
+        if not raw_path or not raw_path.is_file() or raw_path.stat().st_size == 0:
+            print("   ⚠️ scrcpy 未生成有效录像，跳过分段")
+            return False
+        if not Path(FFMPEG_PATH).is_file():
+            print(f"   ⚠️ 找不到 FFmpeg，已保留原始录像: {raw_path.name}")
+            return self._keep_scrcpy_raw()
+
+        work_dir = self.session_dir / ".scrcpy_segments"
+        work_dir.mkdir(exist_ok=True)
+        segment_pattern = work_dir / "segment_%03d.mp4"
+        segment_list = work_dir / "segments.csv"
+        for stale_segment in work_dir.glob("segment_*.mp4"):
+            stale_segment.unlink(missing_ok=True)
+        segment_list.unlink(missing_ok=True)
+        cmd = [
+            FFMPEG_PATH,
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(raw_path),
+            "-map", "0:v:0",
+            "-c", "copy",
+            "-f", "segment",
+            "-segment_time", str(RECORD_SEGMENT_SEC),
+            "-reset_timestamps", "1",
+            "-segment_list", str(segment_list),
+            "-segment_list_type", "csv",
+            str(segment_pattern),
+        ]
+
+        print("   ✂️ 正在按关键帧无损切分逍遥录像...")
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600,
+                creationflags=self.CREATE_NO_WINDOW,
+            )
+            if result.returncode != 0 or not segment_list.is_file():
+                detail = (result.stderr or result.stdout).strip()
+                print(f"   ⚠️ 录像分段失败，已保留原始 MKV: {detail}")
+                return self._keep_scrcpy_raw()
+
+            rows = []
+            with open(segment_list, "r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.reader(handle))
+
+            segment_specs = []
+            base_time = self._scrcpy_started_at or datetime.fromtimestamp(raw_path.stat().st_mtime)
+            for index, row in enumerate(rows):
+                if len(row) < 3:
+                    print("   ⚠️ FFmpeg 分段清单不完整，已保留原始 MKV")
+                    return self._keep_scrcpy_raw()
+                source = work_dir / Path(row[0]).name
+                if not source.is_file() or source.stat().st_size == 0:
+                    print("   ⚠️ FFmpeg 分段文件不完整，已保留原始 MKV")
+                    return self._keep_scrcpy_raw()
+                try:
+                    start_offset = float(row[1])
+                except ValueError:
+                    start_offset = index * RECORD_SEGMENT_SEC
+                segment_time = datetime.fromtimestamp(base_time.timestamp() + start_offset)
+                segment_specs.append((source, segment_time))
+
+            if not segment_specs:
+                print("   ⚠️ FFmpeg 未生成有效分段，已保留原始 MKV")
+                return self._keep_scrcpy_raw()
+
+            completed = []
+            for source, segment_time in segment_specs:
+                destination = self.session_dir / f"screen_{segment_time.strftime('%Y%m%d%H%M%S')}.mp4"
+                suffix = 1
+                while destination.exists():
+                    destination = self.session_dir / (
+                        f"screen_{segment_time.strftime('%Y%m%d%H%M%S')}_{suffix}.mp4"
+                    )
+                    suffix += 1
+                source.replace(destination)
+                completed.append(destination)
+
+            self._record_files.extend(str(path) for path in completed)
+            total_mb = sum(path.stat().st_size for path in completed) / 1024 / 1024
+            print(f"   💾 已生成 {len(completed)} 段录像 ({total_mb:.1f} MB)")
+
+            # 全部分段成功后才删除连续原片和临时清单。
+            raw_path.unlink()
+            segment_list.unlink(missing_ok=True)
+            try:
+                work_dir.rmdir()
+            except OSError:
+                pass
+            return True
+        except subprocess.TimeoutExpired:
+            print("   ⚠️ 录像分段超时，已保留原始 MKV")
+            return self._keep_scrcpy_raw()
+        except Exception as exc:
+            print(f"   ⚠️ 录像分段异常，已保留原始 MKV: {exc}")
+            return self._keep_scrcpy_raw()
+
+    def _keep_scrcpy_raw(self) -> bool:
+        """将有效的连续原片加入摘要，同时保持失败返回值。"""
+        raw_path = self._scrcpy_raw_path
+        if raw_path and raw_path.is_file() and raw_path.stat().st_size > 0:
+            raw_text = str(raw_path)
+            if raw_text not in self._record_files:
+                self._record_files.append(raw_text)
+        return False
+
+    def _stop_scrcpy_process(self):
+        """请求 scrcpy 正常停止；失败时才强制结束。"""
+        if not self._record_proc or self._record_proc.poll() is not None:
+            return
+        try:
+            if sys.platform == "win32":
+                os.kill(self._record_proc.pid, signal.CTRL_BREAK_EVENT)
+            else:
+                self._record_proc.send_signal(signal.SIGINT)
+            self._record_proc.wait(timeout=15)
+        except (subprocess.TimeoutExpired, OSError):
+            print("   ⚠️ scrcpy 停止超时，正在结束进程（原始 MKV 将保留）")
+            try:
+                self._record_proc.terminate()
+                self._record_proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self._record_proc.kill()
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                self._record_proc.kill()
+            except Exception:
+                pass
 
     def _check_device_storage(self):
         """检查设备存储空间，低于 500MB 时清理已拉取的录屏并警告"""
@@ -523,35 +925,38 @@ class AndroidLogger:
                 except Exception:
                     pass
 
-        # 停止录屏（向手机发停止信号，让 screenrecord 优雅结束并保存文件）
+        # 停止录屏并让当前容器正常收尾。
         if self._record_proc and self._record_proc.poll() is None:
-            try:
-                # 用当前录屏文件路径精确匹配，避免误杀其他 screenrecord 进程
-                current_file = f"/sdcard/screen_{self._current_segment:03d}.mp4"
-                subprocess.run(
-                    [ADB_PATH, "-s", self.serial, "shell",
-                     "pkill", "-INT", "-f", current_file],
-                    capture_output=True, timeout=10,
-                    creationflags=self.CREATE_NO_WINDOW,
-                )
-                # 等待录屏进程结束（给时间保存文件）
-                self._record_proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                print("   ⚠️ 录屏进程停止超时，强制终止")
+            if self.is_memu:
+                self._stop_scrcpy_process()
+            else:
                 try:
-                    self._record_proc.kill()
+                    # 用当前录屏文件路径精确匹配，避免误杀其他 screenrecord 进程
+                    current_file = f"/sdcard/screen_{self._current_segment:03d}.mp4"
+                    subprocess.run(
+                        [ADB_PATH, "-s", self.serial, "shell",
+                         "pkill", "-INT", "-f", current_file],
+                        capture_output=True, timeout=10,
+                        creationflags=self.CREATE_NO_WINDOW,
+                    )
+                    self._record_proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    print("   ⚠️ 录屏进程停止超时，强制终止")
+                    try:
+                        self._record_proc.kill()
+                    except Exception:
+                        pass
                 except Exception:
-                    pass
-            except Exception:
-                try:
-                    self._record_proc.kill()
-                except Exception:
-                    pass
+                    try:
+                        self._record_proc.kill()
+                    except Exception:
+                        pass
 
-        # 等录屏线程拉取最后一个文件（最多等 120 秒，因为要拉取大文件）
+        # 等待最后一段拉取，或等待 scrcpy 原片完成无损分段。
         if self._record_thread and self._record_thread.is_alive():
-            print("   ⏳ 等待最后一段录屏拉取完成...")
-            self._record_thread.join(timeout=120)
+            action = "完成无损分段" if self.is_memu else "拉取完成"
+            print(f"   ⏳ 等待最后一段录屏{action}...")
+            self._record_thread.join(timeout=600 if self.is_memu else 120)
 
         # flush + 关闭文件
         if self.log_file:
@@ -597,33 +1002,51 @@ class AndroidLogger:
         print(f'  grep -i "FATAL\\|ANR\\|crash" "{self.session_dir / "logcat_full.log"}"')
         print()
 
+    def _open_session_folder(self):
+        """打印并在 Windows 资源管理器中打开本次采集目录。"""
+        if not self.session_dir:
+            return
+        session_path = self.session_dir.resolve()
+        print(f"📂 采集文件夹: {session_path}")
+        if sys.platform != "win32":
+            return
+        try:
+            subprocess.Popen(
+                ["explorer.exe", str(session_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            print(f"⚠️ 无法自动打开文件夹，请复制上面的路径手动打开: {exc}")
+
     # ---------- 主入口 ----------
-    def run(self):
+    def run(self, offer_emulator_connect: bool = True):
         """主运行流程"""
         print("=" * 60)
         print("  🤖 Android 自动日志采集 & 录屏工具")
         print("=" * 60)
 
-        # 1. 等待设备
+        # 1. 可选快速连接模拟器，然后等待设备
+        if offer_emulator_connect:
+            self.prompt_emulator_connection()
+
         if not self.wait_for_device():
             print("❌ 未检测到设备，退出")
             return
 
-        # 2. 选择录屏方向
+        # 2. 根据录屏后端配置画面尺寸
         if self.enable_record:
-            print("\n录屏方向：")
-            print("  [1] 横屏 1280x720（默认）")
-            print("  [2] 竖屏 720x1280")
-            try:
-                orient = input("请选择 (1/2，直接回车默认横屏): ").strip()
-            except (EOFError, KeyboardInterrupt):
-                orient = ""
-            if orient == "2":
-                self.record_size = RECORD_SIZE_PORTRAIT
-                print("✅ 竖屏模式 720x1280")
+            if self.is_memu:
+                print("\n✅ 逍遥兼容模式：录屏方向自动跟随模拟器画面")
             else:
-                self.record_size = RECORD_SIZE_LANDSCAPE
-                print("✅ 横屏模式 1280x720")
+                print("\n录屏方向：")
+                print("  [1] 横屏（默认，保持设备比例，短边最大 720）")
+                print("  [2] 竖屏（保持设备比例，短边最大 720）")
+                try:
+                    orient = input("请选择 (1/2，直接回车默认横屏): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    orient = ""
+                self._configure_record_size(portrait=orient == "2")
 
         # 3. 初始化
         self._init_session()
@@ -661,11 +1084,15 @@ class AndroidLogger:
 
         if self._stop_event.is_set():
             print("\n⚠️  正在停止采集，请勿关闭窗口...")
-            print("   （正在等待最后一段录屏保存并拉取到本地）")
+            if self.is_memu and self.enable_record:
+                print("   （正在保存连续录像并按关键帧无损分段）")
+            else:
+                print("   （正在等待最后一段录屏保存并拉取到本地）")
 
         # 6. 清理 & 摘要（保持信号处理器活跃，避免清理期间 Ctrl+C 导致崩溃）
         self._stop_all()
         self._print_summary()
+        self._open_session_folder()
 
         # 清理完成后再恢复原始信号处理器
         signal.signal(signal.SIGINT, original_handler)
@@ -706,7 +1133,7 @@ def main():
     )
     if args.serial:
         logger.serial = args.serial
-    logger.run()
+    logger.run(offer_emulator_connect=not bool(args.serial))
 
 
 if __name__ == "__main__":
